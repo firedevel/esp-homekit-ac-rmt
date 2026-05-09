@@ -40,7 +40,6 @@
 #include <app_wifi.h>
 #include <app_hap_setup_payload.h>
 
-#include "esp_pm.h"
 #include "air_conditioner.h"
 
 /* Comment out the below line to disable Firmware Upgrades */
@@ -52,32 +51,25 @@ static const char *TAG = "HAP Air Conditioner";
 #define AIRCONDITIONER_TASK_STACKSIZE 4 * 1024
 #define AIRCONDITIONER_TASK_NAME      "hap_airconditioner"
 
-/* Reset network credentials if button is pressed for more than 3 seconds and then released */
+/* Reset homekit if button is pressed for more than 3 seconds and then released */
 #define RESET_NETWORK_BUTTON_TIMEOUT        3
 
 /* Reset to factory if button is pressed and held for more than 10 seconds */
 #define RESET_TO_FACTORY_BUTTON_TIMEOUT     10
 
 /* The button "Boot" will be used as the Reset button for the example */
-#define RESET_GPIO  GPIO_NUM_0
-
-static void air_conditioner_send_task(void *arg);
-
-TaskHandle_t air_conditioner_send_task_handle = NULL;
+#define RESET_GPIO  GPIO_NUM_9
 
 AC_INFO ac_current_info = {
     .on = false,
     .mode = AUTO_MODE,
-    .temp = 26,
+    .temp = 24,
     .fan_speed = AUTO_FAN_SPEED
 };
 
 static TickType_t ac_send_tick_count = 0;
 
 bool ac_send_r05d_code_flag = false;    // 是否可以发送红外信号
-
-esp_pm_lock_handle_t rmt_send_task_pm_lock = NULL;  // 电源管理锁，用于防止在要使用rmt时自动进入light-sleep状态
-
 /**
  * @brief The network reset button callback handler.
  * Useful for testing the Wi-Fi re-configuration feature of WAC2
@@ -159,11 +151,7 @@ static int air_conditioner_write(hap_write_data_t write_data[], int count,
         void *serv_priv, void *write_priv)
 {
     int i, ret = HAP_SUCCESS;
-    // static float last_fan_speed = 100;
-    // static AC_FAN_SPEED last_fan_mode = AUTO_FAN_SPEED;
-    // bool enable_send = false;
     hap_write_data_t *write;
-    // printf("DEBUG!!!!!!!!!!! count: %d\n", count);
     for (i = 0; i < count; i++) {
         /* 每次只对一个特征hc进行处理 */
         write = &write_data[i];
@@ -173,40 +161,36 @@ static int air_conditioner_write(hap_write_data_t write_data[], int count,
         // int aid = hap_acc_get_aid(hap_serv_get_parent(hap_char_get_parent(write->hc)));
         // printf("Write aid = %d, iid = %d, val = %s\n", aid, iid, emulator_print_value(write->hc, &(write->val)));
         // printf("hap_char_get_type_uuid(write->hc) : %s\n", hap_char_get_type_uuid(write->hc));
-        /* 开关操作 */
-        if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_ACTIVE)) { // ACTIVE实际上是8位的，但是目前HomitKit中只定义了0和1
-            ESP_LOGI(TAG, "Received Write for ACTIVE: %s", write->val.u ? "On" : "Off");
-            if (write->val.u == 0)
-                ac_current_info.on = false;
-            else
-                ac_current_info.on = true;  
-
-            *(write->status) = HAP_STATUS_SUCCESS;
-            
-        } 
-        /* 模式操作 */
-        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_TARGET_HEATER_COOLER_STATE)) 
+        /* 操作 */
+        if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_TARGET_HEATING_COOLING_STATE)) 
         {
-            if (write->val.u == 0)
-            {   // 自动模式
-                ac_current_info.mode = AUTO_MODE;
-                ESP_LOGI(TAG, "Received Write for TARGET_HEATER_COOLER_STATE: Heat or Cool");
-            }
-            else if (write->val.u == 1)
-            {   // 加热模式
+            switch (write->val.u)
+            {
+            case 0:
+                ac_current_info.on = false;
+                break;
+            case 1:
+                // 加热模式
+                ac_current_info.on = true;
                 ac_current_info.mode = HEAT_MODE;
-                ESP_LOGI(TAG, "Received Write for TARGET_HEATER_COOLER_STATE: Heat");
-            }
-            else if (write->val.u == 2)
-            {   // 制冷模式
+                break;
+            case 2:
+                // 制冷模式
+                ac_current_info.on = true;
                 ac_current_info.mode = COOL_MODE;
-                ESP_LOGI(TAG, "Received Write for TARGET_HEATER_COOLER_STATE: Cool");
+                break;
+            case 3:
+                // 自动模式
+                ac_current_info.on = true;
+                ac_current_info.mode = AUTO_MODE;
+                break;
             }
+            ESP_LOGI(TAG, "Received Write for TARGET_HEATING_COOLING_STATE: %u", write->val.u);
         
             *(write->status) = HAP_STATUS_SUCCESS;
         } 
         /* 设定制冷温度操作 */
-        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_COOLING_THRESHOLD_TEMPERATURE))
+        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_TARGET_TEMPERATURE))
         {   /* 根据空调实际温度范围进行限制 */
             if (write->val.f > 30 )
             {
@@ -217,174 +201,81 @@ static int air_conditioner_write(hap_write_data_t write_data[], int count,
                 write->val.f = 17;
             }
             ac_current_info.temp = (uint8_t)write->val.f;
-            ESP_LOGI(TAG, "Received Write for COOLING_THRESHOLD_TEMPERATURE: %d", ac_current_info.temp);
+            ESP_LOGI(TAG, "Received Write for TARGET_TEMPERATURE %d", ac_current_info.temp);
             *(write->status) = HAP_STATUS_SUCCESS;
         }
-        /* 设定制热温度操作 */
-        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_HEATING_THRESHOLD_TEMPERATURE))
-        {   /* 根据空调实际温度范围进行限制 */
-            if (write->val.f < 17)
-            {
-                write->val.f = 17;
-            }
-            /** 因为制热门限在制冷门限的下面
-             * 所以在自动模式，修改上限或下限温度时
-             * ac_current_info.temp先为制冷门限，再被重新赋值为制热门限
-             * 空调实际设置的温度总是以制热门限来确定
-             */
-            ac_current_info.temp = (uint8_t)write->val.f;    
-            ESP_LOGI(TAG, "Received Write for HEATING_THRESHOLD_TEMPERATURE: %d", ac_current_info.temp);
-            *(write->status) = HAP_STATUS_SUCCESS;
-        }
-        /* 风扇转速（风速）操作 */
-        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_ROTATION_SPEED))
-        {
-            if (write->val.f == 100)
-            {   // 自动风
-                ac_current_info.fan_speed = AUTO_FAN_SPEED;
-                ESP_LOGI(TAG, "Received Write for ROTATION_SPEED: Auto");
-            }
-            else if (write->val.f > 0 && write->val.f <= 33)
-            {   // 低风
-                ac_current_info.fan_speed = MIN_FAN_SPEED;
-                ESP_LOGI(TAG, "Received Write for ROTATION_SPEED: Low");
-            }
-            else if (write->val.f > 33 && write->val.f <= 66)
-            {   // 中风
-                ac_current_info.fan_speed = MEDIUM_FAN_SPEED;
-                ESP_LOGI(TAG, "Received Write for ROTATION_SPEED: Medium");
-            }
-            else if (write->val.f > 66 && write->val.f < 100)
-            {   // 高风
-                ac_current_info.fan_speed = MAX_FAN_SPEED;
-                ESP_LOGI(TAG, "Received Write for ROTATION_SPEED: Max");
-            }
-            else if (write->val.f == 0)
-            {
-                ac_current_info.fan_speed = OFF_FAN_SPEED;
-                ESP_LOGI(TAG, "Received Write for ROTATION_SPEED: 0/OFF");
-            }
-            
-            // if (last_fan_mode != ac_current_info.fan_speed)
-            //     enable_send = true;
-            // last_fan_mode = ac_current_info.fan_speed;
-            // last_fan_speed = write->val.f;  // 保存为上一个风速
+        else if (!strcmp(hap_char_get_type_uuid(write->hc), HAP_CHAR_UUID_TEMPERATURE_DISPLAY_UNITS))
+        {   /* 不允许更改温度显示单位 */
+            write->val.u = 0; //摄氏度
+            ESP_LOGI(TAG, "Received Write for TEMPERATURE_DISPLAY_UNITS %d", write->val.u);
             *(write->status) = HAP_STATUS_SUCCESS;
         }
         else {
             *(write->status) = HAP_STATUS_RES_ABSENT;
+            ESP_LOGW(TAG, "Received Write FAIL: %s", hap_char_get_type_uuid(write->hc));
         }
-
         /* If the characteristic write was successful, update it in hap core
          */
         if (*(write->status) == HAP_STATUS_SUCCESS) {
             hap_char_update_val(write->hc, &(write->val));
+            //TODO 立即更新工作状态
         } else {
             /* Else, set the return value appropriately to report error */
-            ESP_LOGE(TAG, "Received Write for Air Conditioner Failed!");
+            ESP_LOGW(TAG, "Received Write for Air Conditioner Failed!");
             ret = HAP_FAIL;
         }
     }
     /* 在保存设定的状态后，使能发送红外指令的信号，并且记录此时的tick计数 */
     ac_send_r05d_code_flag = true;
     ac_send_tick_count = xTaskGetTickCount();   // 更新当前要发红外时的tick计数
-    if (air_conditioner_send_task_handle == NULL)   // 如果没有被创建，则创建air_conditioner_send_task任务
-    {
-        xTaskCreate(air_conditioner_send_task, "air_conditioner_send_task", 2048, NULL, 1, &air_conditioner_send_task_handle);  
-        if (air_conditioner_send_task_handle == NULL)
-            ESP_LOGE(TAG, "Create air_conditioner_send_task fail!");
-    }
-        
     return ret;
 }
 
 static int air_conditioner_read(hap_char_t *hc, hap_status_t *status_code, void *serv_priv, void *read_priv)
 {
-    int ret = HAP_SUCCESS;
-    int iid = hap_char_get_iid(hc);
-    int aid = hap_acc_get_aid(hap_serv_get_parent(hap_char_get_parent(hc)));
-    printf("Read aid = %d, iid = %d, val = %s\n", aid, iid, emulator_print_value(hc, hap_char_get_val(hc)));
-    printf("hap_char_get_type_uuid(hc) : %s\n", hap_char_get_type_uuid(hc));
-    hap_val_t new_val;
+    if (hap_req_get_ctrl_id(read_priv)) {
+        ESP_LOGI(TAG, "Received read %s from %s", hap_char_get_type_uuid(hc), hap_req_get_ctrl_id(read_priv));
+    }
     /* 更新当前模式为设定模式 */
-    if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_CURRENT_HEATER_COOLER_STATE)) 
+    if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_CURRENT_HEATING_COOLING_STATE)) 
     {
-        if (ac_current_info.mode == HEAT_MODE)
-        {   // 加热模式
-            new_val.u = 2;
-            ESP_LOGI(TAG, "Received Read for CURRENT_HEATER_COOLER_STATE: Heat");
+        hap_val_t new_val;
+
+        if(ac_current_info.on){
+            switch (ac_current_info.mode)
+            {
+            case HEAT_MODE:
+                new_val.u = 1;
+                break;
+            case COOL_MODE:
+                new_val.u = 2;
+                break;
+            case AUTO_MODE:
+                // 自动模式
+                //TODO: 读取环境温度并判断制冷/加热
+                new_val.u = 1;  // 显示为加热
+                break;
+            }
+        } else {
+            new_val.u = 0;
         }
-        else if (ac_current_info.mode == COOL_MODE)
-        {   // 制冷模式
-            new_val.u = 3;
-            ESP_LOGI(TAG, "Received Read for CURRENT_HEATER_COOLER_STATE: Cool");
-        }
-        else if (ac_current_info.mode == AUTO_MODE)
-        {   // 自动模式
-            new_val.u = 1;  // 显示为Idle
-            ESP_LOGI(TAG, "Received Read for CURRENT_HEATER_COOLER_STATE: Cool");
-        }
+        ESP_LOGI(TAG, "Received read for CURRENT_HEATING_COOLING_STATE: %u", new_val.u);
+        hap_char_update_val(hc, &new_val);
         *status_code = HAP_STATUS_SUCCESS;
     }
     /* 更新当前温度为空调设定温度 */
     else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_CURRENT_TEMPERATURE)) 
     {
+        hap_val_t new_val;
+
+        //TODO: 读取环境温度
         new_val.f = ac_current_info.temp;
-        ESP_LOGI(TAG, "Received Read for CURRENT_TEMPERATURE: %d", ac_current_info.temp);
+        ESP_LOGI(TAG, "Received read for CURRENT_TEMPERATURE: %d", ac_current_info.temp);
+        hap_char_update_val(hc, &new_val);
         *status_code = HAP_STATUS_SUCCESS;
-    }
-    /* 下面这些特征有读写权限，在write回调函数中可以被更新 */
-    /* 开关状态 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_ACTIVE))
-    {
-        *status_code = HAP_STATUS_SUCCESS;
-        return HAP_SUCCESS;     // 因为这些特征不需要被更新，为了防止后面的hap_char_update_val传入的为空，直接返回
-    }
-    /* 目标加热冷却状态 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_TARGET_HEATER_COOLER_STATE))
-    {
-        *status_code = HAP_STATUS_SUCCESS;
-        return HAP_SUCCESS;
-    }
-    /* 加热温度门限 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_HEATING_THRESHOLD_TEMPERATURE))
-    {   // 修改为空调设定温度，而非门限
-        new_val.f = ac_current_info.temp;  // 更新为空调设定温度
-        ESP_LOGI(TAG, "Received Read for HEATING_THRESHOLD_TEMPERATURE: %d", ac_current_info.temp);
-        *status_code = HAP_STATUS_SUCCESS;
-    }
-    /* 冷却温度门限 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_COOLING_THRESHOLD_TEMPERATURE))
-    {
-        new_val.f = ac_current_info.temp;    // 更新为空调设定温度
-        ESP_LOGI(TAG, "Received Read for COOLING_THRESHOLD_TEMPERATURE: %d", ac_current_info.temp);
-        *status_code = HAP_STATUS_SUCCESS;
-    }
-    /* 名字 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_NAME))
-    {
-        *status_code = HAP_STATUS_SUCCESS;
-        return HAP_SUCCESS;
-    }
-    /* 风速 */
-    else if (!strcmp(hap_char_get_type_uuid(hc), HAP_CHAR_UUID_ROTATION_SPEED))
-    {
-        *status_code = HAP_STATUS_SUCCESS;
-        return HAP_SUCCESS;
-    }
-    else 
-    {
-        *status_code = HAP_STATUS_RES_ABSENT;
     }
 
-    if (*status_code == HAP_STATUS_SUCCESS)
-    {
-        hap_char_update_val(hc, &new_val);
-    } else {
-        ret = HAP_FAIL;
-    }
-    
-    return ret;
+    return HAP_SUCCESS;
 }
 
 /*The main thread for handling the Air Conditioner Accessory */
@@ -400,11 +291,11 @@ static void air_conditioner_thread_entry(void *arg)
      * the mandatory services internally
      */
     hap_acc_cfg_t cfg = {
-        .name = "AirConditioner_dormitory",
-        .manufacturer = "DM",
-        .model = "Esp32_01",
-        .serial_num = "0000001",
-        .fw_rev = "0.1.1",
+        .name = "AirConditioner",
+        .manufacturer = "Media",
+        .model = "KJR-90D/BK",
+        .serial_num = "DEV0001",
+        .fw_rev = "1.0",
         .hw_rev = "1.0",
         .pv = "1.1.0",
         .identify_routine = air_conditioner_identify,
@@ -415,51 +306,28 @@ static void air_conditioner_thread_entry(void *arg)
     accessory = hap_acc_create(&cfg);
     if (!accessory) {
         ESP_LOGE(TAG, "Failed to create accessory");
-        goto air_conditioner_err;
+        goto thermostat_err;
     }
 
     /* Add a dummy Product Data */
-    uint8_t product_data[] = {'E','S','P','3','2','H','A','P'};
+    uint8_t product_data[] = {'Z','H','X','K','Q','0','0','1'};
     hap_acc_add_product_data(accessory, product_data, sizeof(product_data));
 
     /* Create the Air Conditioner Service. Include the "name" since this is a user visible service  */
-    service = hap_air_conditioner_create();
+    service = hap_serv_thermostat_create(0, 0, 24.0, 24.0, 0);      // 实际上创建的是加热器制冷器
+    hap_serv_add_char(service, hap_char_name_create("AirConditioner"));
+
     if (!service) {
-        ESP_LOGE(TAG, "Failed to create air_conditioner Service");
-        goto air_conditioner_err;
+        ESP_LOGE(TAG, "Failed to create thermostat Service");
+        goto thermostat_err;
     }
 
-    /* Add the optional characteristic to the Air Conditioner Service */
-    int ret = hap_serv_add_char(service, hap_char_name_create("air_conditioner_DM"));
-    ret |= hap_serv_add_char(service, hap_char_rotation_speed_create(100.0));    // 添加转速
-    if (ret != HAP_SUCCESS) {
-        ESP_LOGE(TAG, "Failed to add optional characteristics to AirConditioner");
-        goto air_conditioner_err;
-    }
     /* Set the write callback for the service */
     hap_serv_set_write_cb(service, air_conditioner_write);
     
     hap_serv_set_read_cb(service, air_conditioner_read);
     /* Add the Air Conditioner Service to the Accessory Object */
     hap_acc_add_serv(accessory, service);
-
-#ifdef CONFIG_FIRMWARE_SERVICE
-    /*  Required for server verification during OTA, PEM format as string  */
-    static char server_cert[] = {};
-    hap_fw_upgrade_config_t ota_config = {
-        .server_cert_pem = server_cert,
-    };
-    /* Create and add the Firmware Upgrade Service, if enabled.
-     * Please refer the FW Upgrade documentation under components/homekit/extras/include/hap_fw_upgrade.h
-     * and the top level README for more information.
-     */
-    service = hap_serv_fw_upgrade_create(&ota_config);
-    if (!service) {
-        ESP_LOGE(TAG, "Failed to create Firmware Upgrade Service");
-        goto air_conditioner_err;
-    }
-    hap_acc_add_serv(accessory, service);
-#endif
 
     /* Add the Accessory to the HomeKit Database */
     hap_add_accessory(accessory);
@@ -497,28 +365,8 @@ static void air_conditioner_thread_entry(void *arg)
 #endif
 
     /* Enable Hardware MFi authentication (applicable only for MFi variant of SDK) */
-    hap_enable_mfi_auth(HAP_MFI_AUTH_HW);
+    //hap_enable_mfi_auth(HAP_MFI_AUTH_HW);
 
-    /**
-     * Configure dynamic frequency scaling:
-     * maximum and minimum frequencies are set in sdkconfig,
-     * automatic light sleep is enabled if tickless idle support is enabled. 
-     * 
-     */
-#if CONFIG_PM_ENABLE
-#if CONFIG_IDF_TARGET_ESP32
-    esp_pm_config_esp32_t pm_config = {
-        .max_freq_mhz = CONFIG_APP_MAX_CPU_FREQ_MHZ,
-        .min_freq_mhz = CONFIG_APP_MIN_CPU_FREQ_MHZ,
-#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
-        .light_sleep_enable = true
-#endif
-    };
-    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-#endif
-#endif
-
-    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "rmt_send_task", &rmt_send_task_pm_lock));     // 创建锁
     /* Initialize Wi-Fi */
     app_wifi_init();
 
@@ -530,7 +378,7 @@ static void air_conditioner_thread_entry(void *arg)
     /* The task ends here. The read/write callbacks will be invoked by the HAP Framework */
     vTaskDelete(NULL);
 
-air_conditioner_err:
+thermostat_err:
     hap_acc_delete(accessory);
     vTaskDelete(NULL);
 }
@@ -542,47 +390,25 @@ air_conditioner_err:
 static void air_conditioner_send_task(void *arg)
 {
     TickType_t nowTickCount = 0;
-    
     while (1)
     {
         if (ac_send_r05d_code_flag == true)
         {
             nowTickCount = xTaskGetTickCount();
-            if ((TickType_t)(nowTickCount - ac_send_tick_count) > pdMS_TO_TICKS(1500))
+            if ((TickType_t)(nowTickCount - ac_send_tick_count) > pdMS_TO_TICKS(1000))
             {
-                esp_pm_lock_acquire(rmt_send_task_pm_lock);  // 获取锁
                 ac_send_r05d_code(ac_current_info);
                 ac_send_r05d_code_flag = false;
-                esp_pm_lock_release(rmt_send_task_pm_lock); // 释放锁
-                air_conditioner_send_task_handle = NULL;    // 赋值为NULL 也就是删除自己
-                vTaskDelete(air_conditioner_send_task_handle);      // 发送一次后删除任务
-
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
+    vTaskDelete(NULL);
 }
-#ifdef CONFIG_PM_PROFILING
-/**
- * 用来打印相关pm的信息
- */
-static void pm_track_task(void *arg)
-{
-    while (1)
-    {
-        esp_pm_dump_locks(stdout);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-    
-    
-}
-#endif
+
 void app_main()
 {
     xTaskCreate(air_conditioner_thread_entry, AIRCONDITIONER_TASK_NAME, AIRCONDITIONER_TASK_STACKSIZE,
             NULL, AIRCONDITIONER_TASK_PRIORITY, NULL);
-#ifdef CONFIG_PM_PROFILING
-    xTaskCreate(pm_track_task, "pm_track_task", 2048, NULL, 0, NULL);
-#endif
+    xTaskCreate(air_conditioner_send_task, "air_conditioner_send_task", 2048, NULL, 10, NULL);
 }

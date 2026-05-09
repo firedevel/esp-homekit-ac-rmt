@@ -1,5 +1,11 @@
 # 接入HomeKit的ESP32空调控制器
+## 此fork劫持红外管，为ESP32-C3 SuperMini改进
+为ESP32-C3 SuperMini改进，劫持红外管，实现空调完美改造  
+将红外接收管拆下，将3.3V GND连接到ESP，将数据pin接到GPIO4即可使用  
+重置按钮已改为ESP32-C3 SuperMini的BOOT键(IO9)
+
 ## 更新日志
+<details>
 
 - **2021.9.25**：根据power_save例程添加了light-sleep模式及DFS，系统自动决定CPU频率和是否进入light-sleep模式。
 
@@ -47,6 +53,7 @@
   > 相关宏定义会在main/Kconfig.projbuild文件中自动生成。
   >
   > 附上修改后的[app_wifi.c](/docs/changed_src/app_wifi.c)文件。
+</details>
 
 ## 介绍
 
@@ -66,16 +73,6 @@
 
 - 这个项目，我很多东西也都是才接触，所以难免有不准确不合适或者错误的地方，看到的兄弟麻烦指出来。
 - [视频地址](https://www.bilibili.com/video/BV1eU4y137YL/)
-
-## 硬件连接
-
-只用了一个GPIO18，你可以选择IO直接驱动红外二极管，最好加个NPN三极管或者N沟道的MOSFET驱动。一开始测试的时候我是IO18接到红外二极管正极，通过一个220欧的电阻再到GND，我担心把IO搞坏掉，所以电阻阻值比较大，在220欧的情况下，红外发射距离大致只有5m。所以后面打样的PCB中设计的电路如下：
-
-[具体的AD文件](/docs/原理图PCB)
-
-> 如果图片不显示，请科学上网。或者到/docs/images/目录下查看。
-
-![H0](/docs/images/H0.png)
 
 
 ## 环境搭建

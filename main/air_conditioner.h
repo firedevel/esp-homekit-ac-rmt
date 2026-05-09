@@ -4,7 +4,7 @@
 
 #include "hap.h"
 
-#define RMT_TX_GPIO     GPIO_NUM_18
+#define RMT_TX_GPIO     GPIO_NUM_4
 /* 空调设定模式 */
 typedef enum {
     AUTO_MODE = 0,

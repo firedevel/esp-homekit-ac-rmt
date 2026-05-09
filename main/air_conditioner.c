@@ -60,13 +60,7 @@ const uint8_t kCoolixTempMap[kCoolixTempRange] = {
 };
 
 
-hap_serv_t *hap_air_conditioner_create(void)
-{
-    hap_serv_t *hs = hap_serv_heater_cooler_create(0, 26.0, 0, 0);      // 实际上创建的是加热器制冷器
-    hap_serv_add_char(hs, hap_char_heating_threshold_temperature_create(24.0));     // 可以理解为制热模式的初始温度，以及自动模式的初始下限
-    hap_serv_add_char(hs, hap_char_cooling_threshold_temperature_create(26.0));     // 制冷模式的初始温度，以及自动模式的初始上限
-    return hs;
-}
+
 
 /**
  * @brief 初始化rmt模块
@@ -76,9 +70,8 @@ void air_conditioner_init(void)
 {
     /* 红外初始化 */
     rmt_config_t rmt_tx_config = RMT_DEFAULT_CONFIG_TX(RMT_TX_GPIO, ac_tx_channel);
-    rmt_tx_config.tx_config.carrier_en = true;
-    rmt_tx_config.flags = RMT_CHANNEL_FLAGS_AWARE_DFS;
-    rmt_tx_config.clk_div = 1;
+    rmt_tx_config.tx_config.carrier_en = false;
+    rmt_tx_config.flags |= RMT_CHANNEL_FLAGS_INVERT_SIG;  //反转电平、关闭调制以劫持接收器
     rmt_config(&rmt_tx_config);
     rmt_driver_install(ac_tx_channel, 0, 0);
     ir_builder_config_t ir_builder_config = IR_BUILDER_DEFAULT_CONFIG((ir_dev_t)ac_tx_channel);
